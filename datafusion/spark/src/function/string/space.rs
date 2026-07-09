@@ -78,6 +78,10 @@ impl ScalarUDFImpl for SparkSpace {
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        // ?NOTE: why it does not use make_scalar_function
+        // Dictionary fast path. space's signature accepts Dictionary(Int32, Int32). In spark_space_array
+        // it operates on the dictionary's values (the small deduped set) and reuses the keys — never
+        // decoding to a full array. make_scalar_function would force a decode to a plain array first, killing that win.
         spark_space(&args.args)
     }
 }

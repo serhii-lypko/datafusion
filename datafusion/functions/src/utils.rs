@@ -74,9 +74,13 @@ get_optimal_return_type!(utf8_to_str_type, DataType::LargeUtf8, DataType::Utf8);
 // `utf8_to_int_type`: returns either a Int32 or Int64 based on the input type size.
 get_optimal_return_type!(utf8_to_int_type, DataType::Int64, DataType::Int32);
 
+// !NOTE: scalar here menas row-to-row shape. So basically row-wise mapping.
 /// Creates a scalar function implementation for the given function.
 /// * `inner` - the function to be executed
 /// * `hints` - hints to be used when expanding scalars to arrays
+// !NOTE: what means "expanding scalars to arrays?"
+// Inner function has type Fn(&[ArrayRef]) — it wants arrays, uniform length. But some args came in as Scalar
+// (one value). So before calling inner, make_scalar_function pads each scalar into a full array
 pub fn make_scalar_function<F>(
     inner: F,
     hints: Vec<Hint>,

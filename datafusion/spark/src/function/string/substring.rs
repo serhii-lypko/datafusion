@@ -45,6 +45,8 @@ use std::sync::Arc;
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct SparkSubstring {
     signature: Signature,
+
+    // ?What are aliases exactly?
     aliases: Vec<String>,
 }
 
@@ -105,7 +107,10 @@ impl ScalarUDFImpl for SparkSubstring {
         &self.aliases
     }
 
+    // fires when the running ExecutionPlan pushes a RecordBatch through the projection
+    // and evaluates each expression on it.
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        // builds a closure and invokes it with args argument
         make_scalar_function(spark_substring, vec![])(&args.args)
     }
 
@@ -128,6 +133,11 @@ impl ScalarUDFImpl for SparkSubstring {
 }
 
 fn spark_substring(args: &[ArrayRef]) -> Result<ArrayRef> {
+    dbg!("running spark substring 🟡");
+    dbg!(args);
+    dbg!(&args[0]);
+    dbg!(&args[0].data_type());
+
     let start_array = as_int64_array(&args[1])?;
     let length_array = if args.len() > 2 {
         Some(as_int64_array(&args[2])?)
@@ -136,6 +146,7 @@ fn spark_substring(args: &[ArrayRef]) -> Result<ArrayRef> {
     };
 
     match args[0].data_type() {
+        // Utf8 is the Arrow type tag
         DataType::Utf8 => {
             let array = args[0].as_string::<i32>();
             let is_ascii = enable_ascii_fast_path(&array, start_array, length_array);

@@ -29,14 +29,18 @@ pub mod like;
 pub mod luhn_check;
 pub mod make_valid_utf8;
 pub mod quote;
+pub mod regexp_extract;
 pub mod soundex;
 pub mod space;
 pub mod substring;
+
+// TODO -> need to register somewhere below?
 
 use datafusion_expr::ScalarUDF;
 use datafusion_functions::make_udf_function;
 use std::sync::Arc;
 
+// Each line expands to a pub fn <name>() -> Arc<ScalarUDF> returning that function's shared singleton.
 make_udf_function!(ascii::SparkAscii, ascii);
 make_udf_function!(base64::SparkBase64, base64);
 make_udf_function!(char::CharFunc, char);
@@ -50,6 +54,7 @@ make_udf_function!(luhn_check::SparkLuhnCheck, luhn_check);
 make_udf_function!(format_string::FormatStringFunc, format_string);
 make_udf_function!(space::SparkSpace, space);
 make_udf_function!(substring::SparkSubstring, substring);
+make_udf_function!(regexp_extract::SparkRegexpExtract, regexp_extract);
 make_udf_function!(base64::SparkUnBase64, unbase64);
 make_udf_function!(soundex::SparkSoundex, soundex);
 make_udf_function!(make_valid_utf8::SparkMakeValidUtf8, make_valid_utf8);
@@ -121,6 +126,11 @@ pub mod expr_fn {
         str pos length
     ));
     export_functions!((
+        regexp_extract,
+        "Extracts the first substring of `str` matching `regexp` and returns capture group `idx` (default 1).",
+        str regexp idx
+    ));
+    export_functions!((
         unbase64,
         "Decodes the input string `str` from a base64 string into binary data.",
         str
@@ -143,6 +153,7 @@ pub mod expr_fn {
     ));
 }
 
+// TODO -> need to register here
 pub fn functions() -> Vec<Arc<ScalarUDF>> {
     vec![
         ascii(),
@@ -158,6 +169,7 @@ pub fn functions() -> Vec<Arc<ScalarUDF>> {
         format_string(),
         space(),
         substring(),
+        regexp_extract(),
         unbase64(),
         soundex(),
         make_valid_utf8(),
