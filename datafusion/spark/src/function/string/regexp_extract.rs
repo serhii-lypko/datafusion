@@ -1,21 +1,34 @@
-use arrow::array::{
-    Array, ArrayAccessor, ArrayBuilder, ArrayRef, AsArray, BinaryViewBuilder,
-    GenericBinaryBuilder, GenericStringBuilder, Int64Array, OffsetSizeTrait,
-    StringViewBuilder,
-};
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
+use arrow::array::{
+    Array, ArrayAccessor, ArrayBuilder, ArrayIter, ArrayRef, AsArray,
+    GenericStringBuilder, Int64Array, OffsetSizeTrait, StringViewBuilder,
+};
 use arrow::datatypes::DataType;
-use datafusion_common::{Result, exec_err, not_impl_err};
+use datafusion_common::cast::as_int64_array;
+use datafusion_common::{DataFusionError, Result, exec_err};
 use datafusion_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, TypeSignature,
     Volatility,
 };
 use datafusion_functions::utils::make_scalar_function;
-
-use regex::{CaptureLocations, Regex};
-
+use regex::Regex;
 use std::collections::HashMap;
-use std::sync::Arc;
 
 /*
   ?NOTE: performance surface
@@ -24,13 +37,18 @@ use std::sync::Arc;
   (for example regexp_replace.rs's OptimizedRegex fast path and buffer-level construction).
 */
 
-// TODO -> complete spark semantics
-// - Spark null-intolerant semantics
+// TODO -> don't forget to implement Catalyst's RegExpExtract 2-arg form
+// ->> one UDF, 2-or-3 arity, column-capable
+// ->> what's left: switch idx from Exact(Int64) to Coercible so Int32 also matches (Spark's idx is Int32).
 
-/// Spark-compatible `regexp_extract` expression
-/// <https://spark.apache.org/docs/latest/api/sql/index.html#regexp_extract>
+/// Spark-compatible `regexp_extract` expression.
 ///
-/// TODO -> describe semantics (like in substring)
+/// `regexp_extract(str, regexp[, idx])` - extracts the first match of `regexp`
+/// in `str` and returns capture group `idx` (default 1; 0 = whole match).
+///
+/// Docs:
+/// - <https://spark.apache.org/docs/latest/api/sql/index.html#regexp_extract>
+/// - <https://docs.databricks.com/aws/en/sql/language-manual/functions/regexp_extract>
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct SparkRegexpExtract {
     signature: Signature,
@@ -65,8 +83,6 @@ impl SparkRegexpExtract {
     }
 }
 
-// TODO -> what is ArrowBuilder choices? (GenericBinaryBuilder, GenericStringBuilder etc.)
-
 impl ScalarUDFImpl for SparkRegexpExtract {
     fn name(&self) -> &str {
         "regexp_extract"
@@ -87,12 +103,6 @@ impl ScalarUDFImpl for SparkRegexpExtract {
     // fn return_field_from_args() {}
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
-        // ! 🟡 How exactly make_scalar_function re-collapses all-scalar inputs back to a Scalar at the end? 🟡
-
-        // TODO variant -> use make_scalar_function + the HashMap cache. Clean, idiomatic, correct, matches substring.rs.
-        // Add one doc line: "A constant pattern is compiled once via the cache; a dedicated Scalar
-        // fast path (compile before the loop, skip expansion) is a possible further optimization."
-
         make_scalar_function(spark_regexp_extract, vec![])(&args.args)
     }
 }
@@ -122,73 +132,136 @@ impl ScalarUDFImpl for SparkRegexpExtract {
 */
 
 fn spark_regexp_extract(args: &[ArrayRef]) -> Result<ArrayRef> {
-    let pattern_array = args[1].as_string::<i32>();
+    // idx (arg 2) is optional; Spark defaults it to 1.
     let idx_array = if args.len() > 2 {
         Some(as_int64_array(&args[2])?)
     } else {
-        // Default as idx = 1
         None
     };
 
-    // TODO -> figure out downcasting.
-
+    // Dispatch on the subject's string type. The signature guarantees `str` and
+    // `regexp` share the same string type, so both downcast the same way. Output
+    // mirrors the input string type. Binary / other -> error.
     match args[0].data_type() {
-        // Utf8 is the Arrow type tag
-        DataType::Utf8 => {
-            let array = args[0].as_string::<i32>();
-
-            // spark_substring_generic(
-            //     &array,
-            //     start_array,
-            //     length_array,
-            //     GenericStringBuilder::<i32>::new(),
-            //     is_ascii,
-            // )
-        }
-        DataType::LargeUtf8 => {
-            let array = args[0].as_string::<i64>();
-
-            // spark_substring_generic(
-            //     &array,
-            //     start_array,
-            //     length_array,
-            //     GenericStringBuilder::<i64>::new(),
-            //     is_ascii,
-            // )
-        }
-        DataType::Utf8View => {
-            let array = args[0].as_string_view();
-
-            // spark_substring_generic(
-            //     &array,
-            //     start_array,
-            //     length_array,
-            //     StringViewBuilder::new(),
-            //     is_ascii,
-            // )
-        }
+        DataType::Utf8 => spark_regexp_generic(
+            args[0].as_string::<i32>(),
+            args[1].as_string::<i32>(),
+            idx_array,
+            GenericStringBuilder::<i32>::new(),
+        ),
+        DataType::LargeUtf8 => spark_regexp_generic(
+            args[0].as_string::<i64>(),
+            args[1].as_string::<i64>(),
+            idx_array,
+            GenericStringBuilder::<i64>::new(),
+        ),
+        DataType::Utf8View => spark_regexp_generic(
+            args[0].as_string_view(),
+            args[1].as_string_view(),
+            idx_array,
+            StringViewBuilder::new(),
+        ),
         other => exec_err!(
-            "Unsupported data type {other:?} for function spark_regexp_extract, expected Utf8View, Utf8, LargeUtf8."
+            "Unsupported data type {other:?} for function regexp_extract, expected Utf8, LargeUtf8 or Utf8View."
         ),
     }
+}
 
-    // creating Regex is expensive so create hashmap for memoization
-    // must have cache - never compile per-row
-    // one map per batch
+trait RegexpExtractBuilder: ArrayBuilder {
+    fn append_value(&mut self, val: &str);
+    fn append_null(&mut self);
+}
+
+impl<O: OffsetSizeTrait> RegexpExtractBuilder for GenericStringBuilder<O> {
+    fn append_value(&mut self, val: &str) {
+        GenericStringBuilder::append_value(self, val);
+    }
+    fn append_null(&mut self) {
+        GenericStringBuilder::append_null(self);
+    }
+}
+
+impl RegexpExtractBuilder for StringViewBuilder {
+    fn append_value(&mut self, val: &str) {
+        StringViewBuilder::append_value(self, val);
+    }
+    fn append_null(&mut self) {
+        StringViewBuilder::append_null(self);
+    }
+}
+
+/// Batch-level driver. Holds all Spark `RegExpExtractBase.extract` semantics:
+///   - null-intolerant: any null input (subject/pattern/idx) -> null row
+///   - no match -> "" (empty string, NOT null)
+///   - idx validated only AFTER a match: idx < 0 || idx > group_count -> error
+///     (so a no-match with an out-of-range idx still returns "")
+///   - optional group that did not participate -> ""
+fn spark_regexp_generic<'a, S, Builder>(
+    subject: S,
+    pattern: S,
+    idx_array: Option<&Int64Array>,
+    mut builder: Builder,
+) -> Result<ArrayRef>
+where
+    S: ArrayAccessor<Item = &'a str>,
+    Builder: RegexpExtractBuilder,
+{
     let mut patterns: HashMap<String, Regex> = HashMap::new();
 
-    /*
-      Reuse from regexp_replace (shape only): the HashMap<String,Regex> cache, the ArrayIter+zip per-row loop,
-      the match datatype { Utf8/LargeUtf8 => ..., Utf8View => ... } collect, and (if you add flags) the (?flags) prepend trick.
-    */
+    for (row, (s, p)) in ArrayIter::new(subject)
+        .zip(ArrayIter::new(pattern))
+        .enumerate()
+    {
+        // idx defaults to 1 (Catalyst 2-arg form); a null idx nulls the row.
+        let idx = match idx_array {
+            Some(a) if a.is_null(row) => None,
+            Some(a) => Some(a.value(row)),
+            None => Some(1_i64),
+        };
 
-    todo!()
+        // Spark: null-intolerant (any null input -> null output).
+        let (s, p, idx) = match (s, p, idx) {
+            (Some(s), Some(p), Some(idx)) => (s, p, idx),
+            _ => {
+                builder.append_null();
+                continue;
+            }
+        };
+
+        if !patterns.contains_key(p) {
+            // RE2 rejects PCRE-only constructs (backreferences, lookaround).
+            let re = Regex::new(p).map_err(|e| {
+                DataFusionError::Execution(format!(
+                    "regexp_extract: failed to compile pattern '{p}': {e}"
+                ))
+            })?;
+            patterns.insert(p.to_string(), re);
+        }
+        let re = &patterns[p];
+
+        match re.captures(s) {
+            None => builder.append_value(""),
+            Some(caps) => {
+                let group_count = caps.len() - 1;
+                if idx < 0 || idx as usize > group_count {
+                    return exec_err!(
+                        "regexp_extract: invalid group index {idx}, pattern has {group_count} group(s)"
+                    );
+                }
+
+                // Optional group that did not participate -> "".
+                builder.append_value(caps.get(idx as usize).map_or("", |m| m.as_str()));
+            }
+        }
+    }
+
+    Ok(builder.finish())
 }
 
 // TODO -> consider inlining some of the methods/handlers?
 
 /*
-  Reasoning notes
+  --->> Design notes <<---
 
   - Why not PCRE (backtracking engine).
   A vectorized engine processing untrusted user patterns cannot accept exponential backtracking —
@@ -200,6 +273,18 @@ fn spark_regexp_extract(args: &[ArrayRef]) -> Result<ArrayRef> {
   Patterns using backreferences/lookaround succeed in Spark and error in given impl.
   Everything else matches.
 
+  - Using make_scalar_function.
+  Micro opmimization vector: hand-roll alternative to make_scalar_function.
+  The legit reason you might hand-roll it: compile a constant pattern exactly once. With make_scalar_function,
+  a constant pattern gets expanded to N identical strings, and your HashMap<String,Regex> cache collapses them
+  back to one compile — but you pay N cache lookups + the array materialization. Hand-rolling lets you check
+  "is the pattern a Scalar? compile once, skip the map."
+
+  - Using builder over Vec<Option<String>>
+  TODO: more descriptive.
+  Clean design fit. Moderate performance optimization.
+  One heap allocation per row + the Vec. The final copy into the output buffer happens either way.
+
    - Why not just wrap datafusion/functions/src/regex/regexpreplace.rs
   Wrong operation: it replaces matched text and returns the modified string. Wrong signature. Wrong output rules.
 
@@ -209,17 +294,96 @@ fn spark_regexp_extract(args: &[ArrayRef]) -> Result<ArrayRef> {
   - Adding/skipping flags (see regexp_replace).
   TODO -> most reasonable would be mention them, but point as skipped in terms of time spent
 
-  - Micro opmimization: hand-roll alternative to make_scalar_function
-  The legit reason you might hand-roll it: compile a constant pattern exactly once. With make_scalar_function,
-  a constant pattern gets expanded to N identical strings, and your HashMap<String,Regex> cache collapses them
-  back to one compile — but you pay N cache lookups + the array materialization. Hand-rolling lets you check
-  "is the pattern a Scalar? compile once, skip the map."
+  ...
+
+  --->> Further performance vectors <<---
+
+  - Arrow builder
+  regexp_replace.rs's OptimizedRegex fast path (rewrites anchored single-group patterns for direct extraction)
+  and buffer-level output construction (write values/offsets buffers directly, skipping the builder).
+  Both are replace-specific micro-opts; correctness-focused pass uses the pattern cache + standard string builders instead.
 
 */
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::StringArray;
 
-    // TODO -> signature match/mismatch
+    // Focused on the Spark-semantics corner cases.
+
+    /// Single-row helper: drives the real batch entry point.
+    fn run_one(pattern: &str, subject: &str, idx: i64) -> Result<String> {
+        let s = StringArray::from(vec![subject]);
+        let p = StringArray::from(vec![pattern]);
+        let i = Int64Array::from(vec![idx]);
+        let out =
+            spark_regexp_generic(&s, &p, Some(&i), GenericStringBuilder::<i32>::new())?;
+        Ok(out.as_string::<i32>().value(0).to_string())
+    }
+
+    #[test]
+    fn basic_group_extraction() {
+        assert_eq!(run_one(r"(\d+)-(\d+)", "100-200", 1).unwrap(), "100");
+        assert_eq!(run_one(r"(\d+)-(\d+)", "100-200", 2).unwrap(), "200");
+    }
+
+    #[test]
+    fn idx_zero_is_whole_match() {
+        assert_eq!(run_one(r"(\d+)-(\d+)", "100-200", 0).unwrap(), "100-200");
+    }
+
+    #[test]
+    fn no_match_returns_empty_not_null() {
+        // Invariant: no match -> "" (never null).
+        assert_eq!(run_one(r"(\d+)", "abc", 1).unwrap(), "");
+    }
+
+    #[test]
+    fn optional_group_absent_returns_empty() {
+        // "(a)(x)?" matches "a"; group 2 is optional and absent -> "".
+        assert_eq!(run_one(r"(a)(x)?", "abc", 2).unwrap(), "");
+    }
+
+    #[test]
+    fn idx_out_of_range_errors() {
+        let err = run_one(r"(\d+)-(\d+)", "100-200", 5).unwrap_err();
+        assert!(err.to_string().contains("invalid group index"));
+    }
+
+    #[test]
+    fn negative_idx_with_match_errors() {
+        let err = run_one(r"(a)", "abc", -1).unwrap_err();
+        assert!(err.to_string().contains("invalid group index"));
+    }
+
+    #[test]
+    fn out_of_range_idx_with_no_match_returns_empty() {
+        // Nuance: idx is checked only after a match. No match -> "" (no error).
+        assert_eq!(run_one(r"(\d+)", "abc", 9).unwrap(), "");
+    }
+
+    #[test]
+    fn unsupported_pattern_errors() {
+        // RE2 has no backreferences; Spark (Java) would accept this.
+        let err = run_one(r"(a)\1", "aa", 1).unwrap_err();
+        assert!(err.to_string().contains("failed to compile pattern"));
+    }
+
+    #[test]
+    fn null_input_yields_null_row() {
+        // Array level: null subject -> null output (null-intolerant).
+        let subject = StringArray::from(vec![Some("100-200"), None]);
+        let pattern = StringArray::from(vec![Some(r"(\d+)"), Some(r"(\d+)")]);
+        let out = spark_regexp_generic(
+            &subject,
+            &pattern,
+            None,
+            GenericStringBuilder::<i32>::new(),
+        )
+        .unwrap();
+        let out = out.as_string::<i32>();
+        assert_eq!(out.value(0), "100");
+        assert!(out.is_null(1));
+    }
 }

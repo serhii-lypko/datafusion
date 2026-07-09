@@ -74,7 +74,7 @@ get_optimal_return_type!(utf8_to_str_type, DataType::LargeUtf8, DataType::Utf8);
 // `utf8_to_int_type`: returns either a Int32 or Int64 based on the input type size.
 get_optimal_return_type!(utf8_to_int_type, DataType::Int64, DataType::Int32);
 
-// !NOTE: scalar here menas row-to-row shape. So basically row-wise mapping.
+// !NOTE: scalar here means row-to-row shape. So basically row-wise mapping.
 /// Creates a scalar function implementation for the given function.
 /// * `inner` - the function to be executed
 /// * `hints` - hints to be used when expanding scalars to arrays
@@ -89,6 +89,8 @@ where
     F: Fn(&[ArrayRef]) -> Result<ArrayRef>,
 {
     move |args: &[ColumnarValue]| {
+        // dbg!(&args);
+
         // first, identify if any of the arguments is an Array. If yes, store its `len`,
         // as any scalar will need to be converted to an array of len `len`.
         let len = args
@@ -101,8 +103,13 @@ where
         let is_scalar = len.is_none();
 
         let inferred_length = len.unwrap_or(1);
+
+        // args that have a hint get it; args beyond the hint list get Pad
+        // (pad means expand given scalar to a full-length array -> the batch's row count, the inferred_length)
+        // so basically means take a Scalar(1) and materialize [1, 1, 1, ...]
         let args = args
             .iter()
+            // every arg is guaranteed a hint — real ones first, Pad for the rest
             .zip(hints.iter().chain(std::iter::repeat(&Hint::Pad)))
             .map(|(arg, hint)| {
                 // Decide on the length to expand this scalar to depending
@@ -115,7 +122,12 @@ where
             })
             .collect::<Result<Vec<_>>>()?;
 
+        // dbg!(&args);
+
         let result = (inner)(&args);
+
+        // dbg!(&result);
+
         if is_scalar {
             // If all inputs are scalar, keeps output as scalar
             let result = result.and_then(|arr| ScalarValue::try_from_array(&arr, 0));
