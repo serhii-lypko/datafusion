@@ -45,8 +45,6 @@ use std::sync::Arc;
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct SparkSubstring {
     signature: Signature,
-
-    // ?What are aliases exactly?
     aliases: Vec<String>,
 }
 
@@ -107,15 +105,8 @@ impl ScalarUDFImpl for SparkSubstring {
         &self.aliases
     }
 
-    // fires when the running ExecutionPlan pushes a RecordBatch through the projection
-    // and evaluates each expression on it.
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
-        // dbg!(&args.args);
-
-        // builds a closure and invokes it with args argument
-        let res = make_scalar_function(spark_substring, vec![])(&args.args);
-        dbg!(&res);
-        res
+        make_scalar_function(spark_substring, vec![])(&args.args)
     }
 
     fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
@@ -145,18 +136,9 @@ fn spark_substring(args: &[ArrayRef]) -> Result<ArrayRef> {
     };
 
     match args[0].data_type() {
-        // Utf8 is the Arrow type tag
         DataType::Utf8 => {
-            // converting a general, type-erased handle back to its specific concrete type by downcasting
             let array = args[0].as_string::<i32>();
             let is_ascii = enable_ascii_fast_path(&array, start_array, length_array);
-
-            // dbg!("running spark substring 🟡");
-            // dbg!(args);
-            // dbg!(&array);
-            // dbg!(&start_array);
-            // dbg!(&length_array);
-
             spark_substring_generic(
                 &array,
                 start_array,
@@ -384,11 +366,6 @@ fn spark_substring_generic<'a, Source, Item, Builder>(
 where
     Source: ArrayAccessor<Item = &'a Item>,
     Item: SubstringItem + ?Sized + 'a,
-    // Builder is a write-only sink for the output column being constructed.
-    //
-    // The builder is the Arrow output-array constructor — it consumes values
-    // row by row and it produces the finished array. Arrow array is not build by
-    // writing into a Vec; instead use a builder that manages the 3 buffers (values, offsets, validity).
     Builder: SubstringBuilder<Item = Item>,
 {
     for i in 0..array.len() {

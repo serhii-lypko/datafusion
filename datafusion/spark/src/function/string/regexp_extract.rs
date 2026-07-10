@@ -30,25 +30,20 @@ use datafusion_functions::utils::make_scalar_function;
 use regex::Regex;
 use std::collections::HashMap;
 
-/*
-  ?NOTE: performance surface
-
-  It's implicit. Scalar-pattern specialization, avoiding per-row compiles, Arrow builder choices
-  (for example regexp_replace.rs's OptimizedRegex fast path and buffer-level construction).
-*/
-
-// TODO -> don't forget to implement Catalyst's RegExpExtract 2-arg form
-// ->> one UDF, 2-or-3 arity, column-capable
-// ->> what's left: switch idx from Exact(Int64) to Coercible so Int32 also matches (Spark's idx is Int32).
-
-/// Spark-compatible `regexp_extract` expression.
+/// Spark-compatible `regexp_extract` expression
+/// <https://spark.apache.org/docs/latest/api/sql/index.html#regexp_extract>
 ///
-/// `regexp_extract(str, regexp[, idx])` - extracts the first match of `regexp`
-/// in `str` and returns capture group `idx` (default 1; 0 = whole match).
+/// Returns capture group `idx` of the first match of `regexp` in `str`.
+/// `idx` defaults to 1; 0 means the whole match.
 ///
-/// Docs:
-/// - <https://spark.apache.org/docs/latest/api/sql/index.html#regexp_extract>
-/// - <https://docs.databricks.com/aws/en/sql/language-manual/functions/regexp_extract>
+/// Follows Spark's `RegExpExtractBase.extract`:
+/// - any null input -> null
+/// - no match -> "" (not null), even if `idx` is out of range
+/// - unmatched optional group -> ""
+/// - after a match, `idx < 0 || idx > group_count` -> error
+///
+/// Patterns are compiled with the Rust `regex` crate.
+/// Backreferences and lookaround are unsupported and result in an error.
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct SparkRegexpExtract {
     signature: Signature,
@@ -62,17 +57,14 @@ impl Default for SparkRegexpExtract {
 
 impl SparkRegexpExtract {
     pub fn new() -> Self {
-        // Spark: regexp_extract(str, regexp[, idx]); idx defaults to 1.
         use DataType::*;
+
         Self {
-            // accepts only concrete types, no conversion. If a variant doesn't match exactly, next one will be tried.
             signature: Signature::one_of(
                 vec![
-                    // (str, regexp, idx)
                     TypeSignature::Exact(vec![Utf8View, Utf8View, Int64]),
                     TypeSignature::Exact(vec![Utf8, Utf8, Int64]),
                     TypeSignature::Exact(vec![LargeUtf8, LargeUtf8, Int64]),
-                    // (str, regexp) -> idx defaults to 1
                     TypeSignature::Exact(vec![Utf8View, Utf8View]),
                     TypeSignature::Exact(vec![Utf8, Utf8]),
                     TypeSignature::Exact(vec![LargeUtf8, LargeUtf8]),
@@ -92,56 +84,22 @@ impl ScalarUDFImpl for SparkRegexpExtract {
         &self.signature
     }
 
-    // TODO -> need to figure out.
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
-        // Spark: output type == subject (arg 0) type.
-        // TODO -> null semantics via return_field_from_args (null if any input null).
         Ok(arg_types[0].clone())
     }
-
-    // TODO -> implement?
-    // fn return_field_from_args() {}
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         make_scalar_function(spark_regexp_extract, vec![])(&args.args)
     }
 }
 
-// From the datafusion/functions/src/regex/regexpreplace.rs
-// the array-plumbing + cache skeleton transfers
-
-/*
-  *Scalars caching example
-
-  SELECT regexp_extract('100-200', '(\\d+)-(\\d+)', 1);
-
-  - '100-200' → Scalar(Utf8("100-200"))
-  - '(\d+)-(\d+)' → Scalar(Utf8("(\d+)-(\d+)")) (the SQL \\d unescapes to \d)
-  - 1 → Scalar(Int32(1))
-
-  >> In the cache: only the pattern. One entry:
-  key:   "(\d+)-(\d+)"        // the pattern string
-  value: Regex(/(\d+)-(\d+)/)  // compiled
-
-  The subject and idx are not cached — the cache exists only to avoid recompiling regexes,
-  and neither '100-200' nor 1 gets compiled. No reason to store them:
-  subject and idx just get expanded (copied) to arrays and read per-row — no caching,
-  because reading a value is free. Can only cache things that are expensive to produce,
-  and a regex is the only expensive thing here (compilation). A string or an int is
-  cheap to just copy and read.
-*/
-
 fn spark_regexp_extract(args: &[ArrayRef]) -> Result<ArrayRef> {
-    // idx (arg 2) is optional; Spark defaults it to 1.
     let idx_array = if args.len() > 2 {
         Some(as_int64_array(&args[2])?)
     } else {
         None
     };
 
-    // Dispatch on the subject's string type. The signature guarantees `str` and
-    // `regexp` share the same string type, so both downcast the same way. Output
-    // mirrors the input string type. Binary / other -> error.
     match args[0].data_type() {
         DataType::Utf8 => spark_regexp_generic(
             args[0].as_string::<i32>(),
@@ -190,12 +148,6 @@ impl RegexpExtractBuilder for StringViewBuilder {
     }
 }
 
-/// Batch-level driver. Holds all Spark `RegExpExtractBase.extract` semantics:
-///   - null-intolerant: any null input (subject/pattern/idx) -> null row
-///   - no match -> "" (empty string, NOT null)
-///   - idx validated only AFTER a match: idx < 0 || idx > group_count -> error
-///     (so a no-match with an out-of-range idx still returns "")
-///   - optional group that did not participate -> ""
 fn spark_regexp_generic<'a, S, Builder>(
     subject: S,
     pattern: S,
@@ -258,67 +210,19 @@ where
     Ok(builder.finish())
 }
 
-// TODO -> consider inlining some of the methods/handlers?
-
-/*
-  --->> Design notes <<---
-
-  - Why not PCRE (backtracking engine).
-  A vectorized engine processing untrusted user patterns cannot accept exponential backtracking —
-  linear-time guarantee is a feature Spark itself lacks (Java regex can blow up).
-  RE2 is O(nm) - input x pattern_size
-  TODO -> define overview what gets missed when choosing RE2 over PCRE. And what are benefits.
-
-  - RegExp engines mismatch.
-  Patterns using backreferences/lookaround succeed in Spark and error in given impl.
-  Everything else matches.
-
-  - Using make_scalar_function.
-  Micro opmimization vector: hand-roll alternative to make_scalar_function.
-  The legit reason you might hand-roll it: compile a constant pattern exactly once. With make_scalar_function,
-  a constant pattern gets expanded to N identical strings, and your HashMap<String,Regex> cache collapses them
-  back to one compile — but you pay N cache lookups + the array materialization. Hand-rolling lets you check
-  "is the pattern a Scalar? compile once, skip the map."
-
-  - Using builder over Vec<Option<String>>
-  TODO: more descriptive.
-  Clean design fit. Moderate performance optimization.
-  One heap allocation per row + the Vec. The final copy into the output buffer happens either way.
-
-   - Why not just wrap datafusion/functions/src/regex/regexpreplace.rs
-  Wrong operation: it replaces matched text and returns the modified string. Wrong signature. Wrong output rules.
-
-  - Escaping.
-  TODO
-
-  - Adding/skipping flags (see regexp_replace).
-  TODO -> most reasonable would be mention them, but point as skipped in terms of time spent
-
-  ...
-
-  --->> Further performance vectors <<---
-
-  - Arrow builder
-  regexp_replace.rs's OptimizedRegex fast path (rewrites anchored single-group patterns for direct extraction)
-  and buffer-level output construction (write values/offsets buffers directly, skipping the builder).
-  Both are replace-specific micro-opts; correctness-focused pass uses the pattern cache + standard string builders instead.
-
-*/
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use arrow::array::StringArray;
 
-    // Focused on the Spark-semantics corner cases.
-
-    /// Single-row helper: drives the real batch entry point.
     fn run_one(pattern: &str, subject: &str, idx: i64) -> Result<String> {
-        let s = StringArray::from(vec![subject]);
-        let p = StringArray::from(vec![pattern]);
-        let i = Int64Array::from(vec![idx]);
-        let out =
-            spark_regexp_generic(&s, &p, Some(&i), GenericStringBuilder::<i32>::new())?;
+        let out = spark_regexp_generic(
+            &StringArray::from(vec![subject]),
+            &StringArray::from(vec![pattern]),
+            Some(&Int64Array::from(vec![idx])),
+            GenericStringBuilder::<i32>::new(),
+        )?;
+
         Ok(out.as_string::<i32>().value(0).to_string())
     }
 

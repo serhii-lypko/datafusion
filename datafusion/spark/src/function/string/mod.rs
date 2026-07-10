@@ -34,13 +34,10 @@ pub mod soundex;
 pub mod space;
 pub mod substring;
 
-// TODO -> need to register somewhere below?
-
 use datafusion_expr::ScalarUDF;
 use datafusion_functions::make_udf_function;
 use std::sync::Arc;
 
-// Each line expands to a pub fn <name>() -> Arc<ScalarUDF> returning that function's shared singleton.
 make_udf_function!(ascii::SparkAscii, ascii);
 make_udf_function!(base64::SparkBase64, base64);
 make_udf_function!(char::CharFunc, char);
@@ -153,7 +150,6 @@ pub mod expr_fn {
     ));
 }
 
-// TODO -> need to register here
 pub fn functions() -> Vec<Arc<ScalarUDF>> {
     vec![
         ascii(),
