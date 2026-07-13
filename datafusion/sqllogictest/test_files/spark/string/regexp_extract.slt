@@ -1,0 +1,142 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Spark `regexp_extract(str, regexp[, idx])`.
+#
+# Cases ported from Spark's own golden file
+#   sql/core/src/test/resources/sql-tests/results/regexp-functions.sql.out
+# with two translations:
+#   - escaping: Spark SQL unescapes '\\d+' -> '\d+'; DataFusion's parser keeps
+#     backslashes literal, so patterns are written with a single backslash.
+#   - errors: Spark raises SparkRuntimeException
+#     (INVALID_PARAMETER_VALUE.REGEX_GROUP_INDEX); we raise a DataFusion
+#     execution error with different wording (a documented mismatch).
+# Expected values verified against real Spark via
+#   playground/spark-oracle/regexp_extract_oracle.py
+
+##
+## Scalar inputs (ported from Spark golden)
+##
+
+# 2-arg form: idx defaults to 1. Pattern has 0 groups -> idx 1 out of range -> error.
+query error invalid group index
+SELECT regexp_extract('1a 2b 14m', '\d+');
+
+# idx 0 = whole match
+query T
+SELECT regexp_extract('1a 2b 14m', '\d+', 0);
+----
+1
+
+query error invalid group index
+SELECT regexp_extract('1a 2b 14m', '\d+', 1);
+
+query error invalid group index
+SELECT regexp_extract('1a 2b 14m', '\d+', 2);
+
+query error invalid group index
+SELECT regexp_extract('1a 2b 14m', '\d+', -1);
+
+# optional group that participated
+query T
+SELECT regexp_extract('1a 2b 14m', '(\d+)?', 1);
+----
+1
+
+# optional group that did NOT participate -> "" (empty, not null)
+query T
+SELECT regexp_extract('a b m', '(\d+)?', 1);
+----
+(empty)
+
+# two groups, 2-arg form -> idx defaults to 1
+query T
+SELECT regexp_extract('1a 2b 14m', '(\d+)([a-z]+)');
+----
+1
+
+query T
+SELECT regexp_extract('1a 2b 14m', '(\d+)([a-z]+)', 0);
+----
+1a
+
+query T
+SELECT regexp_extract('1a 2b 14m', '(\d+)([a-z]+)', 1);
+----
+1
+
+query T
+SELECT regexp_extract('1a 2b 14m', '(\d+)([a-z]+)', 2);
+----
+a
+
+query error invalid group index
+SELECT regexp_extract('1a 2b 14m', '(\d+)([a-z]+)', 3);
+
+query error invalid group index
+SELECT regexp_extract('1a 2b 14m', '(\d+)([a-z]+)', -1);
+
+query T
+SELECT regexp_extract('1a 2b 14m', '(\d+)?([a-z]+)', 1);
+----
+1
+
+# leading optional group absent -> "" (empty)
+query T
+SELECT regexp_extract('a b m', '(\d+)?([a-z]+)', 1);
+----
+(empty)
+
+##
+## Null handling (Spark null-intolerant: any null input -> null)
+##
+
+query T
+SELECT regexp_extract(NULL, '(\d+)', 1);
+----
+NULL
+
+##
+## Array inputs (mix of match / no-match / null)
+##
+
+query T
+SELECT regexp_extract(s, '([a-z]+)(\d+)', 2)
+FROM (VALUES ('a1'), ('bb22'), (NULL)) t(s);
+----
+1
+22
+NULL
+
+##
+## Engine deviations from Spark (Rust `regex` is RE2, not Java/PCRE)
+##
+## These patterns MATCH in Spark but are rejected by RE2. Spark's expected
+## outputs (from the oracle) are noted; we intentionally error instead.
+
+# Backreference. Spark: 'a'. RE2 has no backreferences -> compile error.
+query error failed to compile pattern
+SELECT regexp_extract('aa', '(a)\1', 1);
+
+# Lookahead. Spark: 'foo'. RE2 has no lookaround -> compile error.
+query error failed to compile pattern
+SELECT regexp_extract('foobar', 'foo(?=bar)', 0);
+
+# Java-only inline flag (?l). Spark also errors here (invalid pattern), as does
+# RE2 (unknown flag) -- both reject, only the message differs.
+query error failed to compile pattern
+SELECT regexp_extract('1a 2b 14m', '(?l)');
